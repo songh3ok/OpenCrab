@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / "apps" / ".env", override=False)
@@ -23,6 +23,7 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 from opencrab.config import get_settings
 from opencrab.grammar.manifest import SPACES
 from opencrab.grammar.validator import describe_grammar, validate_edge, validate_node
+from opencrab.integrations import SOURCE_TYPES, SourceFetchError, fetch_source_documents
 from opencrab.ontology.impact import ImpactEngine
 from opencrab.ontology.query import HybridQuery
 from opencrab.stores.factory import make_doc_store, make_graph_store, make_sql_store, make_vector_store
@@ -41,9 +42,55 @@ QUERY_EVENTS = {"query"}
 
 
 class IngestRequest(BaseModel):
-    text: str = Field(..., min_length=1, description="Text to ingest into the ontology vector layer.")
+    """Accept either raw text ingest or external source ingest (web UI contract)."""
+
+    text: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Text to ingest into the ontology vector layer.",
+    )
+    source_type: str | None = Field(
+        default=None,
+        description=f"External source connector. One of: {', '.join(SOURCE_TYPES)}.",
+    )
+    access_token: str | None = Field(
+        default=None,
+        description="API/OAuth token for the selected source_type.",
+    )
+    source_url: str | None = Field(
+        default=None,
+        description="Optional source URL (repo, Drive file, Notion page, Obsidian API base).",
+    )
+    query: str | None = Field(
+        default=None,
+        description="Optional search query used by source connectors.",
+    )
+    max_items: int = Field(
+        default=25,
+        ge=1,
+        le=50,
+        description="Maximum number of source documents to ingest.",
+    )
     source_id: str | None = Field(default=None, description="Optional stable source identifier.")
-    metadata: dict[str, Any] = Field(default_factory=dict, description="Optional metadata for the ingested source.")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional metadata for the ingested source.",
+    )
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "IngestRequest":
+        has_text = bool(self.text and self.text.strip())
+        has_source = bool(self.source_type and self.access_token)
+        if has_text or has_source:
+            if self.source_type and self.source_type not in SOURCE_TYPES:
+                raise ValueError(
+                    f"Unsupported source_type '{self.source_type}'. "
+                    f"Expected one of: {', '.join(SOURCE_TYPES)}"
+                )
+            return self
+        raise ValueError(
+            "Provide either `text` or both `source_type` and `access_token`."
+        )
 
 
 class QueryRequest(BaseModel):
@@ -464,22 +511,22 @@ def get_manifest(auth: AuthContext = Depends(require_auth)) -> dict[str, Any]:
     return describe_grammar()
 
 
-@app.post("/api/ingest")
-def ingest_text(
-    payload: IngestRequest,
-    auth: AuthContext = Depends(require_auth),
-    ctx: ApiContext = Depends(get_context),
+def _ingest_one(
+    ctx: ApiContext,
+    auth: AuthContext,
+    *,
+    text: str,
+    source_id: str,
+    metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    source_id = payload.source_id or f"{auth.user_id}-{uuid4().hex[:12]}"
     _enforce_ingest_limits(ctx, auth, source_id)
+    meta = dict(metadata)
+    meta.setdefault("user_id", auth.user_id)
+    meta.setdefault("source_id", source_id)
 
-    metadata = dict(payload.metadata)
-    metadata.setdefault("user_id", auth.user_id)
-    metadata.setdefault("source_id", source_id)
+    result = ctx.hybrid.ingest(text=text, source_id=source_id, metadata=meta)
 
-    result = ctx.hybrid.ingest(text=payload.text, source_id=source_id, metadata=metadata)
-
-    source_doc_id = _write_source_doc(ctx.docs, source_id, payload.text, metadata)
+    source_doc_id = _write_source_doc(ctx.docs, source_id, text, meta)
     if source_doc_id:
         result["stores"]["documents"] = f"ok (id={source_doc_id})"
     elif _docs_available(ctx.docs):
@@ -493,18 +540,123 @@ def ingest_text(
         auth.user_id,
         {
             "source_id": source_id,
-            "text_length": len(payload.text),
+            "text_length": len(text),
             "tier": auth.tier,
+            "source_type": meta.get("source_type"),
         },
     )
-    _meter_call(ctx, auth, "/api/ingest")
-
-    result["tier"] = auth.tier
-    result["usage"] = {
-        "user_sources": _count_user_sources(ctx.docs, auth.user_id),
-        "user_vectors": _count_user_sources(ctx.docs, auth.user_id),
-    }
     return result
+
+
+@app.post("/api/ingest")
+def ingest_text(
+    payload: IngestRequest,
+    auth: AuthContext = Depends(require_auth),
+    ctx: ApiContext = Depends(get_context),
+) -> dict[str, Any]:
+    # Mode A — raw text (original contract)
+    if payload.text and payload.text.strip() and not payload.source_type:
+        source_id = payload.source_id or f"{auth.user_id}-{uuid4().hex[:12]}"
+        result = _ingest_one(
+            ctx,
+            auth,
+            text=payload.text,
+            source_id=source_id,
+            metadata=dict(payload.metadata),
+        )
+        _meter_call(ctx, auth, "/api/ingest")
+        result["tier"] = auth.tier
+        result["usage"] = {
+            "user_sources": _count_user_sources(ctx.docs, auth.user_id),
+            "user_vectors": _count_user_sources(ctx.docs, auth.user_id),
+        }
+        return result
+
+    # Mode B — external source connectors (web UI contract)
+    assert payload.source_type and payload.access_token
+    try:
+        documents = fetch_source_documents(
+            payload.source_type,
+            access_token=payload.access_token,
+            query=payload.query,
+            source_url=payload.source_url,
+            max_items=payload.max_items,
+        )
+    except SourceFetchError as exc:
+        status_code = exc.status_code or status.HTTP_502_BAD_GATEWAY
+        if status_code == 401:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+        if status_code == 403:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+        if status_code == 400:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    if not documents:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No documents found for source_type={payload.source_type!r}.",
+        )
+
+    batch_id = payload.source_id or f"{auth.user_id}-{payload.source_type}-{uuid4().hex[:10]}"
+    ingested: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    for doc in documents:
+        item_source_id = f"{batch_id}:{doc.external_id}" if len(documents) > 1 else batch_id
+        metadata = {
+            **dict(payload.metadata),
+            "source_type": payload.source_type,
+            "external_id": doc.external_id,
+            "title": doc.title,
+            "url": doc.url,
+            **dict(doc.metadata),
+        }
+        try:
+            item = _ingest_one(
+                ctx,
+                auth,
+                text=doc.text,
+                source_id=item_source_id,
+                metadata=metadata,
+            )
+            ingested.append(
+                {
+                    "source_id": item_source_id,
+                    "external_id": doc.external_id,
+                    "title": doc.title,
+                    "vector_id": item.get("vector_id"),
+                    "stores": item.get("stores"),
+                }
+            )
+        except HTTPException as exc:
+            # Free-tier limits should stop the batch early.
+            if exc.status_code in {status.HTTP_429_TOO_MANY_REQUESTS, status.HTTP_403_FORBIDDEN}:
+                if not ingested:
+                    raise
+                errors.append({"external_id": doc.external_id, "error": str(exc.detail)})
+                break
+            errors.append({"external_id": doc.external_id, "error": str(exc.detail)})
+        except Exception as exc:  # noqa: BLE001 — keep batch resilient
+            logger.warning("Source ingest item failed (%s): %s", doc.external_id, exc)
+            errors.append({"external_id": doc.external_id, "error": str(exc)})
+
+    _meter_call(ctx, auth, "/api/ingest")
+    return {
+        "ok": True,
+        "mode": "source",
+        "source_type": payload.source_type,
+        "batch_id": batch_id,
+        "requested": len(documents),
+        "ingested": len(ingested),
+        "items": ingested,
+        "errors": errors,
+        "tier": auth.tier,
+        "usage": {
+            "user_sources": _count_user_sources(ctx.docs, auth.user_id),
+            "user_vectors": _count_user_sources(ctx.docs, auth.user_id),
+        },
+    }
 
 
 @app.post("/api/query")
